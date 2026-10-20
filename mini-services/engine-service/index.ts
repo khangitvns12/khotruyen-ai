@@ -12,7 +12,8 @@ import { handleRest } from './src/router'
 import { setIo, emitStats } from './src/emitter'
 import { logs, logInfo, logWarn, logSuccess, logError } from './src/logger'
 
-const PORT = 3002
+// Railway/Render/Fly assign PORT dynamically; sandbox default is 3002.
+const PORT = Number(process.env.PORT) || 3002
 
 const httpServer = createServer((req, res) => {
   void handleRest(req, res, engine)
@@ -55,7 +56,7 @@ setInterval(() => {
 
 httpServer.listen(PORT, () => {
   logSuccess(`Engine online trên cổng ${PORT} — job chạy nền, độc lập với tab trình duyệt`)
-  logInfo('Socket.io: /engine-io (client: io("/engine-io?XTransformPort=3002"))')
+  logInfo(`Socket.io: /engine-io (sandbox client: io("/engine-io?XTransformPort=${PORT}") / remote: io(ENGINE_PUBLIC_URL, { path: "/engine-io" }))`)
 })
 
 process.on('SIGTERM', () => {

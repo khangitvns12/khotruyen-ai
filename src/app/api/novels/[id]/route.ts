@@ -1,8 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { db } from '@/lib/db'
-import { engineProxy } from '@/lib/engine-client'
+import { engineProxy, engineRelay } from '@/lib/engine-client'
 import { errorResponse, findNovelSummary, HttpError } from '@/lib/api-helpers'
-import type { ChapterSummary, ChapterStatus } from '@/lib/types'
+import { REMOTE_ENGINE, type ChapterSummary, type ChapterStatus } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
@@ -17,8 +17,13 @@ interface ChapterSummaryRow {
   hasTranslated: number | boolean
 }
 
-/** GET /api/novels/[id] — novel + chapter summaries (raw SQL for efficiency). */
-export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+/** GET /api/novels/[id] — novel + chapter summaries (remote: relayed). */
+export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  if (REMOTE_ENGINE) {
+    const { id } = await params
+    return engineRelay(req, `/novels/${encodeURIComponent(id)}`)
+  }
+
   try {
     const { id } = await params
 

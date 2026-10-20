@@ -185,4 +185,13 @@ export const SITES: SiteInfo[] = [
 ]
 
 export const ENGINE_PORT = 3002
-export const ENGINE_URL = 'http://localhost:3002'
+export const ENGINE_URL = process.env.ENGINE_URL || 'http://localhost:3002'
+/**
+ * Remote-engine mode: when the engine runs on another host (Vercel deployment),
+ * ALL /api data routes proxy to it instead of reading SQLite via Prisma.
+ * Enabled by ENGINE_READS=remote, or automatically when ENGINE_URL points to a non-local host.
+ */
+export const REMOTE_ENGINE =
+  process.env.ENGINE_READS === 'remote' ||
+  (!!process.env.ENGINE_URL &&
+    !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?\/?/i.test(process.env.ENGINE_URL))

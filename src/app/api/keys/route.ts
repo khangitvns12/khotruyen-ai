@@ -1,10 +1,14 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { errorResponse, HttpError, insertApiKey, listApiKeyViews, readJsonBody } from '@/lib/api-helpers'
+import { engineRelay } from '@/lib/engine-client'
+import { REMOTE_ENGINE } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
-/** GET /api/keys — list keys (never exposes the full key). */
-export async function GET() {
+/** GET /api/keys — list keys (never exposes the full key; remote: relayed). */
+export async function GET(req: NextRequest) {
+  if (REMOTE_ENGINE) return engineRelay(req, '/keys')
+
   try {
     const keys = await listApiKeyViews()
     return NextResponse.json({ ok: true, keys })
@@ -19,6 +23,8 @@ export async function GET() {
  * 'AIza' are saved but flagged with a `warning`.
  */
 export async function POST(req: NextRequest) {
+  if (REMOTE_ENGINE) return engineRelay(req, '/keys')
+
   try {
     const body = await readJsonBody(req)
 

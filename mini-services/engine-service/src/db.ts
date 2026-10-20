@@ -1,7 +1,9 @@
 import { Database } from 'bun:sqlite'
 import type { NovelRow, ChapterRow, JobRowDb, ApiKeyRow, NovelSummary, JobRow } from './types'
 
-const DB_PATH = process.env.ENGINE_DB || '/home/z/my-project/db/custom.db'
+// Default: <repo-root>/db/custom.db (portable — works on any host).
+// Override with ENGINE_DB (e.g. Railway volume: ENGINE_DB=/data/custom.db).
+const DB_PATH = process.env.ENGINE_DB || `${import.meta.dir}/../../../db/custom.db`
 
 declare global {
   // eslint-disable-next-line no-var

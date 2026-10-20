@@ -132,6 +132,21 @@ export async function engineHealth(): Promise<boolean> {
  *  - malformed request body  → 400 `JSON không hợp lệ`
  */
 export async function engineProxy(req: NextRequest, path: string): Promise<NextResponse> {
+  return engineProxyCommon(req, path)
+}
+
+/**
+ * Remote-engine relay (REMOTE_ENGINE mode): like engineProxy but for ALL
+ * methods (GET included) and appends the incoming request's FULL search
+ * string (e.g. `?q=`, `?lang=vi&chapters=1-100`) to the engine path.
+ * Used by data routes that normally read SQLite via Prisma locally.
+ */
+export async function engineRelay(req: NextRequest, path: string): Promise<NextResponse> {
+  return engineProxyCommon(req, path + (req.nextUrl.search || ''))
+}
+
+/** Shared proxy/relay implementation (method + body forwarding + error mapping). */
+async function engineProxyCommon(req: NextRequest, path: string): Promise<NextResponse> {
   const method = req.method.toUpperCase()
 
   let body: string | undefined
@@ -171,4 +186,70 @@ export async function engineProxy(req: NextRequest, path: string): Promise<NextR
   }
 
   return NextResponse.json(engineResponse, { status: 200 })
+}
+
+/**
+ * RAW (non-JSON) relay for remote-engine mode — streams the engine's
+ * response body back verbatim (e.g. the export .txt download), passing
+ * through its status and Content-Type / Content-Disposition headers.
+ * Error mapping mirrors engineProxy (503 offline / 504 timeout / 502
+ * engine error envelope as JSON).
+ */
+export async function engineRelayRaw(req: NextRequest, path: string): Promise<NextResponse> {
+  const method = req.method.toUpperCase()
+  const pathWithQuery = path + (req.nextUrl.search || '')
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ENGINE_TIMEOUT_MS)
+  try {
+    const res = await fetch(`${ENGINE_URL}${pathWithQuery}`, {
+      method,
+      cache: 'no-store',
+      signal: controller.signal,
+    })
+
+    // Engine error envelopes are JSON — relay them with the proxy status mapping.
+    const contentType = res.headers.get('content-type') ?? ''
+    if (!contentType.includes('text/plain')) {
+      let parsed: unknown = null
+      try {
+        parsed = await res.json()
+      } catch {
+        parsed = null
+      }
+      if (parsed === null || typeof parsed !== 'object') {
+        return NextResponse.json(
+          { ok: false, error: 'Phản hồi không hợp lệ từ engine' },
+          { status: 502 },
+        )
+      }
+      const envelope = parsed as EngineResponse
+      if (envelope.ok === true) {
+        return NextResponse.json(envelope, { status: 200 })
+      }
+      const error = typeof envelope.error === 'string' ? envelope.error : 'Lỗi engine'
+      if (error === ENGINE_OFFLINE_ERROR) {
+        return NextResponse.json({ ok: false, error }, { status: 503 })
+      }
+      if (error === ENGINE_TIMEOUT_ERROR) {
+        return NextResponse.json({ ok: false, error }, { status: 504 })
+      }
+      return NextResponse.json(envelope, { status: 502 })
+    }
+
+    // Raw success: stream the body with the engine's headers verbatim.
+    const headers: Record<string, string> = {}
+    const engineContentType = res.headers.get('content-type')
+    if (engineContentType) headers['Content-Type'] = engineContentType
+    const engineDisposition = res.headers.get('content-disposition')
+    if (engineDisposition) headers['Content-Disposition'] = engineDisposition
+    return new NextResponse(res.body, { status: res.status, headers })
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'AbortError' || err.name === 'TimeoutError')) {
+      return NextResponse.json({ ok: false, error: ENGINE_TIMEOUT_ERROR }, { status: 504 })
+    }
+    return NextResponse.json({ ok: false, error: ENGINE_OFFLINE_ERROR }, { status: 503 })
+  } finally {
+    clearTimeout(timer)
+  }
 }

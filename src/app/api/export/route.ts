@@ -1,10 +1,14 @@
-import { NextResponse } from 'next/server'
+import { NextResponse, type NextRequest } from 'next/server'
 import { errorResponse } from '@/lib/api-helpers'
+import { engineRelay } from '@/lib/engine-client'
+import { REMOTE_ENGINE } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
-/** GET /api/export — public Export API documentation. */
-export async function GET() {
+/** GET /api/export — public Export API documentation (remote: relayed). */
+export async function GET(req: NextRequest) {
+  if (REMOTE_ENGINE) return engineRelay(req, '/export')
+
   try {
     return NextResponse.json({
       ok: true,

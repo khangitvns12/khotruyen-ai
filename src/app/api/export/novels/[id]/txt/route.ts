@@ -1,6 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { errorResponse, HttpError, parseExportLang, sanitizeFilename } from '@/lib/api-helpers'
+import { engineRelayRaw } from '@/lib/engine-client'
+import { REMOTE_ENGINE } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
@@ -9,8 +11,14 @@ export const dynamic = 'force-dynamic'
  * novel as a .txt file. `lang=vi` uses translations and falls back
  * to the original content, marking untranslated chapter titles with
  * "(chưa dịch)". Chapters without any text are skipped.
+ * (remote: RAW relay — streams the engine's txt response verbatim)
  */
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  if (REMOTE_ENGINE) {
+    const { id } = await params
+    return engineRelayRaw(req, `/export/novels/${encodeURIComponent(id)}/txt`)
+  }
+
   try {
     const { id } = await params
     const lang = parseExportLang(req.nextUrl.searchParams.get('lang'), 'vi', ['vi', 'src'])

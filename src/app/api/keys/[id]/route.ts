@@ -6,11 +6,18 @@ import {
   readJsonBody,
   updateApiKeyFields,
 } from '@/lib/api-helpers'
+import { engineRelay } from '@/lib/engine-client'
+import { REMOTE_ENGINE } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
-/** PATCH /api/keys/[id] — toggle active / rename label. */
+/** PATCH /api/keys/[id] — toggle active / rename label (remote: relayed). */
 export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  if (REMOTE_ENGINE) {
+    const { id } = await params
+    return engineRelay(req, `/keys/${encodeURIComponent(id)}`)
+  }
+
   try {
     const { id } = await params
     const body = await readJsonBody(req)
@@ -43,8 +50,13 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
   }
 }
 
-/** DELETE /api/keys/[id] — idempotent delete. */
-export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+/** DELETE /api/keys/[id] — idempotent delete (remote: relayed). */
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  if (REMOTE_ENGINE) {
+    const { id } = await params
+    return engineRelay(req, `/keys/${encodeURIComponent(id)}`)
+  }
+
   try {
     const { id } = await params
     await deleteApiKeyRow(id)

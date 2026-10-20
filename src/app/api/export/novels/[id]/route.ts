@@ -1,6 +1,8 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { errorResponse, findNovelSummary, HttpError, parseExportLang } from '@/lib/api-helpers'
+import { engineRelay } from '@/lib/engine-client'
+import { REMOTE_ENGINE } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
@@ -8,8 +10,14 @@ export const dynamic = 'force-dynamic'
  * GET /api/export/novels/[id]?lang=vi|src|both&chapters=1-100
  * Defaults: lang=both, all chapters. `chapters` is an inclusive
  * 1-based range ("from-to" or single "N"), clamped to what exists.
+ * (remote: relayed with the FULL search string)
  */
 export async function GET(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  if (REMOTE_ENGINE) {
+    const { id } = await params
+    return engineRelay(req, `/export/novels/${encodeURIComponent(id)}`)
+  }
+
   try {
     const { id } = await params
     const lang = parseExportLang(req.nextUrl.searchParams.get('lang'), 'both')

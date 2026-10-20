@@ -1,0 +1,5 @@
+node_modules
+engine.log
+*.log
+Dockerfile
+.dockerignore

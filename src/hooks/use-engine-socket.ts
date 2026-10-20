@@ -1,9 +1,15 @@
 "use client";
 
 // ============================================================
-// KhoTruyện AI — socket.io hook kết nối engine (port 3002 qua Caddy)
-// Client: io('/', { path: '/engine-io', query: { XTransformPort: 3002 } })
-// — KHÔNG ghi port trực tiếp trong URL (xem chú thích trong effect)
+// KhoTruyện AI — socket.io hook kết nối engine
+//
+// Hai chế độ kết nối:
+//  1. Remote (Vercel): NEXT_PUBLIC_ENGINE_URL được set (vd
+//     https://khotruyen-engine.up.railway.app) → kết nối trực tiếp
+//     cross-origin tới engine (CORS '*'), KHÔNG dùng XTransformPort.
+//  2. Sandbox (mặc định, KHÔNG đổi hành vi): io('/', { path:
+//     '/engine-io', query: { XTransformPort: 3002 } }) qua Caddy —
+//     KHÔNG ghi port trực tiếp trong URL (xem chú thích trong effect).
 // ============================================================
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -13,6 +19,9 @@ import { api } from "@/lib/client";
 
 const MAX_LOGS = 300;
 const STATS_POLL_MS = 15_000;
+
+/** URL công khai của engine cho chế độ remote (VD: https://khotruyen-engine.up.railway.app). */
+const ENGINE_PUBLIC_URL = process.env.NEXT_PUBLIC_ENGINE_URL;
 
 export interface EngineSocketState {
   /** Socket đang kết nối tới engine hay không */
@@ -92,20 +101,35 @@ export function useEngineSocket(): EngineSocketState {
   }, [seed]);
 
   useEffect(() => {
-    // LƯU Ý (đã kiểm chứng thực tế qua Caddy gateway + socket.io v4.8.4):
-    // `io('/engine-io?XTransformPort=3002')` KHÔNG hoạt động — socket.io-client
-    // hiểu '/engine-io' là *namespace* và transport vẫn đi qua path mặc định '/socket.io'.
-    // Server engine gắn socket.io với `path: '/engine-io'` trên namespace mặc định '/',
-    // nên client phải đặt path qua option và XTransformPort qua `query`:
-    //   → GET/WS /engine-io/?EIO=4&...&XTransformPort=3002  (Caddy forward sang 3002)
-    const socket = io("/", {
-      path: "/engine-io",
-      query: { XTransformPort: "3002" },
-      transports: ["websocket", "polling"],
-      reconnection: true,
-      reconnectionDelay: 1000,
-      timeout: 10000,
-    });
+    let socket: Socket;
+    if (ENGINE_PUBLIC_URL) {
+      // ---- Remote mode: direct cross-origin connection to the engine
+      // (deployed on Railway/Render/Fly). Engine CORS is '*', socket.io
+      // path stays '/engine-io'. No XTransformPort — that is sandbox-only.
+      socket = io(ENGINE_PUBLIC_URL, {
+        path: "/engine-io",
+        transports: ["websocket", "polling"],
+        reconnection: true,
+        reconnectionDelay: 1000,
+        timeout: 15000,
+      });
+    } else {
+      // ---- Sandbox mode (qua Caddy gateway + socket.io v4.8.4) ----
+      // LƯU Ý (đã kiểm chứng thực tế):
+      // `io('/engine-io?XTransformPort=3002')` KHÔNG hoạt động — socket.io-client
+      // hiểu '/engine-io' là *namespace* và transport vẫn đi qua path mặc định '/socket.io'.
+      // Server engine gắn socket.io với `path: '/engine-io'` trên namespace mặc định '/',
+      // nên client phải đặt path qua option và XTransformPort qua `query`:
+      //   → GET/WS /engine-io/?EIO=4&...&XTransformPort=3002  (Caddy forward sang 3002)
+      socket = io("/", {
+        path: "/engine-io",
+        query: { XTransformPort: "3002" },
+        transports: ["websocket", "polling"],
+        reconnection: true,
+        reconnectionDelay: 1000,
+        timeout: 10000,
+      });
+    }
     socketRef.current = socket;
 
     const onConnect = () => setConnected(true);

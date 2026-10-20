@@ -1,13 +1,30 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { db } from '@/lib/db'
-import { engineHealth } from '@/lib/engine-client'
+import {
+  ENGINE_OFFLINE_ERROR,
+  ENGINE_TIMEOUT_ERROR,
+  engineFetch,
+  engineHealth,
+} from '@/lib/engine-client'
 import { errorResponse } from '@/lib/api-helpers'
-import type { EngineStats } from '@/lib/types'
+import { REMOTE_ENGINE, type EngineStats } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
-/** GET /api/stats — DB-computed stats + engine liveness. */
+/** GET /api/stats — DB-computed stats + engine liveness (remote: engine is the source of truth). */
 export async function GET(_req: NextRequest) {
+  if (REMOTE_ENGINE) {
+    // Vercel has no SQLite — the engine serves the stats.
+    const r = await engineFetch('/stats')
+    if (r.ok && r.stats && typeof r.stats === 'object') {
+      return NextResponse.json({ ok: true, stats: r.stats as EngineStats, engineOnline: true })
+    }
+    const error = typeof r.error === 'string' ? r.error : 'Lỗi engine'
+    const status =
+      error === ENGINE_OFFLINE_ERROR ? 503 : error === ENGINE_TIMEOUT_ERROR ? 504 : 502
+    return NextResponse.json({ ok: false, error }, { status })
+  }
+
   try {
     const [
       novels,

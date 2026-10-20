@@ -39,6 +39,39 @@ export interface JobRow {
   finishedAt: number | null
 }
 
+export interface ChapterSummary {
+  id: string
+  novelId: string
+  idx: number // 1-based
+  title: string
+  status: ChapterStatus
+  hasContent: boolean
+  hasTranslated: boolean
+  error: string | null
+}
+
+export interface ChapterFull extends ChapterSummary {
+  sourceUrl: string
+  content: string | null
+  translated: string | null
+  scrapedAt: number | null
+  translatedAt: number | null
+}
+
+/** Never expose the full key to clients (mirror of src/lib/types.ts ApiKeyView). */
+export interface ApiKeyView {
+  id: string
+  provider: string
+  label: string | null
+  keyTail: string | null // last 4 chars
+  active: boolean
+  usageCount: number
+  errorCount: number
+  status: string // ok | rate_limited | error
+  lastUsedAt: number | null
+  createdAt: number
+}
+
 export interface AppSettings {
   geminiModel: string
   sourceLang: string

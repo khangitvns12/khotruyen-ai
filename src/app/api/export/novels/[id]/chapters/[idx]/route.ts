@@ -1,17 +1,27 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { db } from '@/lib/db'
 import { errorResponse, HttpError, parseExportLang } from '@/lib/api-helpers'
+import { engineRelay } from '@/lib/engine-client'
+import { REMOTE_ENGINE } from '@/lib/types'
 
 export const dynamic = 'force-dynamic'
 
 /**
  * GET /api/export/novels/[id]/chapters/[idx]?lang=vi|src|both
- * Single chapter export (default: both languages).
+ * Single chapter export (default: both languages) (remote: relayed).
  */
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string; idx: string }> },
 ) {
+  if (REMOTE_ENGINE) {
+    const { id, idx } = await params
+    return engineRelay(
+      req,
+      `/export/novels/${encodeURIComponent(id)}/chapters/${encodeURIComponent(idx)}`,
+    )
+  }
+
   try {
     const { id, idx } = await params
     if (!/^\d+$/.test(idx)) {
