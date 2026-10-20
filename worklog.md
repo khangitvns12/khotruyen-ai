@@ -102,3 +102,21 @@ Stage Summary:
 - Env vars for deployment — Vercel: ENGINE_URL=https://<engine-host> (auto remote mode) + NEXT_PUBLIC_ENGINE_URL=https://<engine-host> (socket wss); Engine host: PORT (platform-assigned) + ENGINE_DB=/data/custom.db (persistent volume). No env set → 100% sandbox behavior.
 - Deviations: (1) DB was NOT pristine at task start — an hjwzw novel «一世獨尊» was being actively scraped by a job from ~04:56 (before this session) + 1 pre-existing API key; left untouched (not mine), used for parity testing; my only writes: keys round-trip (deleted after) + no-op settings PUT. (2) Remote relay returns 502 for engine validation errors (vs local 404/400) per spec's engineProxy status semantics — bodies/messages identical, frontend api() only checks json.ok so UI unchanged; POST /api/keys remote = 200 vs local 201 (same clause). (3) Sandbox env reaps non-setsid background `next dev` processes (~30–60s) — the system's original dev server had been OOM-killed (dmesg pid 1721); restarted daemonized with `setsid nohup` and it is stable.
 - Work record also saved to /home/z/agent-ctx/4-a-full-stack-developer.md.
+
+---
+Task ID: 4-b + 4-c
+Agent: main (Z.ai Code)
+Task: Production readiness for GitHub + Vercel — deploy artifacts, git cleanup, E2E verification
+
+Work Log:
+- Reviewed 4-a subagent results (18 endpoint shape-parity pairs OK, remote-mode E2E OK, default mode byte-identical; lint clean).
+- mini-services/engine-service/src/db.ts: portable default DB path (import.meta.dir/../../../db/custom.db — resolves to same sandbox file, portable to any host); ENGINE_DB env override documented. Engine hot-reloaded, stats identical.
+- Artifacts created: README.md (full Vietnamese deploy guide: GitHub → Railway engine → Vercel web → Supabase → verification + export API + troubleshooting), .env.example (annotated), mini-services/engine-service/Dockerfile (oven/bun:1 + curl for Cloudflare TLS bypass, ENGINE_DB=/data/custom.db) + .dockerignore, db/.gitkeep.
+- .gitignore rewritten: ignore db/*.db*, all logs, sandbox infra (/skills/, /.zscripts/, /tool-results/, /agent-ctx/, /download/, /upload/, /Caddyfile, /tests/); !.env.example exception.
+- Git cleanup: untracked .env, db/custom.db* (31MB), .zscripts, tool-results, tests, download, agent-ctx, Caddyfile → repo now 145 source files only.
+- Committed e59afbf "Production-ready: remote-engine mode for Vercel + Railway deploy".
+- Browser E2E (agent-browser via :81 gateway): dashboard renders live stats (engine online badge, socket connected; 1 truyện / 2.407 chương / 2.384 đã cào), library shows «一世獨尊» (hjwzw) card with dual progress + actions, reader overlay opens + renders ch.1 source text with "(chưa dịch — hiển thị bản gốc)" fallback, settings shows masked key "Test ••••tciw" + model select. Zero console errors, zero page errors. Mobile 390×844: footer flush (bottom=scrollHeight=3477). Desktop 1280×800: footer flush at content bottom. dev.log clean. Lint exit 0.
+- Services left running: next dev :3000 (setsid nohup), engine :3002, gateway :81. Working tree clean.
+
+Stage Summary:
+- Repo is GitHub/Vercel-ready: env-driven deployment (ENGINE_URL, NEXT_PUBLIC_ENGINE_URL, ENGINE_READS, PORT, ENGINE_DB), engine Dockerfile for Railway/Render/Fly/VPS, postinstall prisma generate for Vercel builds, README.md contains the complete Vietnamese deployment guide matching the final chat answer.
