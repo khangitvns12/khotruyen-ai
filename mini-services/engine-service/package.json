@@ -1,0 +1,16 @@
+{
+  "name": "engine-service",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "iconv-lite": "^0.7.3",
+    "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.3"
+  }
+}

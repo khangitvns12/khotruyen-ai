@@ -1,0 +1,95 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Shared with engine-service (mini-services/engine-service) via raw SQL.
+// Timestamps are epoch milliseconds (Int) so both Prisma and bun:sqlite agree.
+// IDs are crypto.randomUUID() strings provided in code.
+
+model Novel {
+  id              String    @id
+  sourceSite      String    @map("source_site")
+  sourceUrl       String    @unique @map("source_url")
+  title           String
+  author          String?
+  coverUrl        String?   @map("cover_url")
+  description     String?
+  lang            String    @default("zh")
+  status          String?
+  totalChapters   Int       @default(0) @map("total_chapters")
+  scrapedCount    Int       @default(0) @map("scraped_count")
+  translatedCount Int       @default(0) @map("translated_count")
+  createdAt       Int       @map("created_at")
+  updatedAt       Int       @map("updated_at")
+  chapters        Chapter[]
+
+  @@map("novels")
+}
+
+model Chapter {
+  id           String   @id
+  novelId      String   @map("novel_id")
+  idx          Int
+  title        String
+  sourceUrl    String   @map("source_url")
+  content      String?
+  translated   String?
+  // pending | scraped | translating | translated | error
+  status       String   @default("pending")
+  error        String?
+  scrapedAt    Int?     @map("scraped_at")
+  translatedAt Int?     @map("translated_at")
+  novel        Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)
+
+  @@unique([novelId, idx])
+  @@index([novelId])
+  @@map("chapters")
+}
+
+model ApiKey {
+  id         String  @id
+  provider   String  @default("gemini")
+  label      String?
+  key        String
+  keyTail    String? @map("key_tail")
+  active     Boolean @default(true)
+  usageCount Int     @default(0) @map("usage_count")
+  errorCount Int     @default(0) @map("error_count")
+  // ok | rate_limited | error
+  status     String  @default("ok")
+  lastUsedAt Int?    @map("last_used_at")
+  createdAt  Int    @map("created_at")
+
+  @@map("api_keys")
+}
+
+model Setting {
+  key   String @id
+  value String
+
+  @@map("settings")
+}
+
+model Job {
+  id         String  @id
+  // scrape | translate | retry
+  type       String
+  // queued | running | paused | done | error | cancelled
+  status     String  @default("queued")
+  novelId    String? @map("novel_id")
+  params     String  @default("{}")
+  progress   Int     @default(0)
+  total      Int     @default(0)
+  error      String?
+  createdAt  Int     @map("created_at")
+  updatedAt  Int     @map("updated_at")
+  finishedAt Int?    @map("finished_at")
+
+  @@index([status])
+  @@map("jobs")
+}

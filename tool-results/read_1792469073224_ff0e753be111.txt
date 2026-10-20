@@ -1,0 +1,781 @@
+     1→     1→import { all, get, run, now, uuid, sleep, getNovel, getJob, novelRowToSummary } from './db'
+     2→     2→import { log, logInfo, logWarn, logError, logSuccess } from './logger'
+     3→     3→import { emitJob, emitNovel, emitChapter, emitStats } from './emitter'
+     4→     4→import { loadSettings, hasActiveGeminiKeys } from './settings'
+     5→     5→import { detectAdapter, adapterById } from './adapters'
+     6→     6→import { cleanNovelText, normCompare } from './clean'
+     7→     7→import { translateText, GeminiNoKeysError } from './gemini'
+     8→     8→import { supabasePush } from './supabase'
+     9→     9→import type {
+    10→    10→  AppSettings,
+    11→    11→  ChapterRow,
+    12→    12→  EngineStats,
+    13→    13→  JobRowDb,
+    14→    14→  NovelRow,
+    15→    15→  SiteAdapter,
+    16→    16→} from './types'
+    17→    17→
+    18→    18→interface ScrapeTask {
+    19→    19→  jobId: string
+    20→    20→  novelId: string
+    21→    21→  chapterId: string
+    22→    22→}
+    23→    23→
+    24→    24→interface TranslateTask {
+    25→    25→  jobId: string
+    26→    26→  novelId: string
+    27→    27→  chapterId: string
+    28→    28→}
+    29→    29→
+    30→    30→const MAX_WORKERS = 8
+    31→    31→const CONSECUTIVE_ERROR_LIMIT = 20
+    32→    32→
+    33→    33→export class JobEngine {
+    34→    34→  private scrapeQueue: ScrapeTask[] = []
+    35→    35→  private translateQueue: TranslateTask[] = []
+    36→    36→  private inFlight = new Map<string, number>()
+    37→    37→  private consecutiveErrors = new Map<string, number>()
+    38→    38→  private settings: AppSettings
+    39→    39→  private settingsReadAt = 0
+    40→    40→  private scrapeActive = 0
+    41→    41→  private translateActive = 0
+    42→    42→  private statsTimer: ReturnType<typeof setInterval> | null = null
+    43→    43→  readonly startedAt = Date.now()
+    44→    44→  running = false
+    45→    45→
+    46→    46→  start(): void {
+    47→    47→    if (this.running) return
+    48→    48→    this.running = true
+    49→    49→    this.settings = loadSettings()
+    50→    50→    this.settingsReadAt = Date.now()
+    51→    51→
+    52→    52→    // ---- startup resume ----
+    53→    53→    try {
+    54→    54→      run("UPDATE chapters SET status = 'scraped' WHERE status = 'translating'")
+    55→    55→      const runningJobs = all<{ id: string }>("SELECT id FROM jobs WHERE status = 'running'")
+    56→    56→      for (const j of runningJobs) {
+    57→    57→        run('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', 'queued', now(), j.id)
+    58→    58→      }
+    59→    59→      const queued = all<JobRowDb>("SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC")
+    60→    60→      for (const job of queued) {
+    61→    61→        try {
+    62→    62→          this.reenqueueJob(job)
+    63→    63→        } catch (e) {
+    64→    64→          logError(`Không enqueue lại job ${job.id}: ${(e as Error).message}`)
+    65→    65→        }
+    66→    66→      }
+    67→    67→      logInfo(`Engine online — tiếp tục ${queued.length} job đang chờ`)
+    68→    68→    } catch (e) {
+    69→    69→      logError(`Lỗi resume khi khởi động: ${(e as Error).message}`)
+    70→    70→    }
+    71→    71→
+    72→    72→    // ---- worker pools ----
+    73→    73→    for (let i = 0; i < MAX_WORKERS; i++) void this.scrapeWorkerLoop(i)
+    74→    74→    for (let i = 0; i < MAX_WORKERS; i++) void this.translateWorkerLoop(i)
+    75→    75→
+    76→    76→    // ---- stats broadcast ----
+    77→    77→    this.statsTimer = setInterval(() => {
+    78→    78→      try {
+    79→    79→        emitStats(this.buildStats())
+    80→    80→      } catch {
+    81→    81→        /* ignore */
+    82→    82→      }
+    83→    83→    }, 3000)
+    84→    84→  }
+    85→    85→
+    86→    86→  getSettings(): AppSettings {
+    87→    87→    if (Date.now() - this.settingsReadAt > 10000) {
+    88→    88→      this.settings = loadSettings()
+    89→    89→      this.settingsReadAt = Date.now()
+    90→    90→    }
+    91→    91→    return this.settings
+    92→    92→  }
+    93→    93→
+    94→    94→  // ============================================================
+    95→    95→  // Job creation
+    96→    96→  // ============================================================
+    97→    97→
+    98→    98→  /** POST /jobs/scrape — sync fetch meta + upsert novel/chapters, enqueue. */
+    99→    99→  async startScrapeJob(body: Record<string, unknown>): Promise<{ jobId: string; novelId: string; totalChapters: number; tasks: number }> {
+   100→   100→    const url = String(body?.url ?? '').trim()
+   101→   101→    if (!url) throw new Error('Thiếu tham số url')
+   102→   102→    const adapter = detectAdapter(url)
+   103→   103→    if (!adapter) {
+   104→   104→      let host = ''
+   105→   105→      try {
+   106→   106→        host = new URL(url).hostname
+   107→   107→      } catch {
+   108→   108→        /* ignore */
+   109→   109→      }
+   110→   110→      throw new Error(
+   111→   111→        `Không hỗ trợ site ${host || url} — hiện hỗ trợ: 69shuba.com, xbiquge.info, novel543.com, hjwzw.com, truyenfull.live`
+   112→   112→      )
+   113→   113→    }
+   114→   114→    const bookUrl = adapter.normalizeUrl(url)
+   115→   115→
+   116→   116→    logInfo(`Đang tải thông tin truyện từ ${adapter.siteName}: ${bookUrl}`)
+   117→   117→    const { meta, chapters } = await adapter.fetchBook(bookUrl)
+   118→   118→    if (!chapters.length) throw new Error('Không tìm thấy chương nào cho truyện này')
+   119→   119→    const ts = now()
+   120→   120→
+   121→   121→    // ---- upsert novel by source_url ----
+   122→   122→    let novel = get<NovelRow>('SELECT * FROM novels WHERE source_url = ?', bookUrl)
+   123→   123→    let addedChapters = 0
+   124→   124→    if (!novel) {
+   125→   125→      const novelId = uuid()
+   126→   126→      run(
+   127→   127→        `INSERT INTO novels (id, source_site, source_url, title, author, cover_url, description, lang, status, total_chapters, scraped_count, translated_count, created_at, updated_at)
+   128→   128→         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+   129→   129→        novelId,
+   130→   130→        adapter.id,
+   131→   131→        bookUrl,
+   132→   132→        meta.title,
+   133→   133→        meta.author,
+   134→   134→        meta.cover,
+   135→   135→        meta.description,
+   136→   136→        meta.lang,
+   137→   137→        meta.status,
+   138→   138→        chapters.length,
+   139→   139→        0,
+   140→   140→        0,
+   141→   141→        ts,
+   142→   142→        ts
+   143→   143→      )
+   144→   144→      const stmt = (globalThis as any).__engineDb!.prepare(
+   145→   145→        `INSERT INTO chapters (id, novel_id, idx, title, source_url, status) VALUES (?,?,?,?,?, 'pending')`
+   146→   146→      )
+   147→   147→      chapters.forEach((c, i) => stmt.run(uuid(), novelId, i + 1, c.title, c.url))
+   148→   148→      novel = getNovel(novelId)!
+   149→   149→      logSuccess(`Đã thêm truyện mới «${meta.title}» (${chapters.length} chương)`)
+   150→   150→    } else {
+   151→   151→      run(
+   152→   152→        `UPDATE novels SET title=?, author=?, cover_url=?, description=?, status=?, total_chapters=?, updated_at=? WHERE id=?`,
+   153→   153→        meta.title,
+   154→   154→        meta.author ?? novel.author,
+   155→   155→        meta.cover ?? novel.cover_url,
+   156→   156→        meta.description ?? novel.description,
+   157→   157→        meta.status ?? novel.status,
+   158→   158→        chapters.length,
+   159→   159→        ts,
+   160→   160→        novel.id
+   161→   161→      )
+   162→   162→      // append chapters not yet known (match by source_url)
+   163→   163→      const existing = all<{ idx: number; source_url: string }>(
+   164→   164→        'SELECT idx, source_url FROM chapters WHERE novel_id = ?',
+   165→   165→        novel.id
+   166→   166→      )
+   167→   167→      const knownUrls = new Set(existing.map((e) => e.source_url))
+   168→   168→      const takenIdx = new Set<number>(existing.map((e) => e.idx))
+   169→   169→      let appendCounter = Math.max(chapters.length, ...takenIdx, 0)
+   170→   170→      const stmt = (globalThis as any).__engineDb!.prepare(
+   171→   171→        `INSERT INTO chapters (id, novel_id, idx, title, source_url, status) VALUES (?,?,?,?,?, 'pending')`
+   172→   172→      )
+   173→   173→      for (let i = 0; i < chapters.length; i++) {
+   174→   174→        const c = chapters[i]
+   175→   175→        if (knownUrls.has(c.url)) continue
+   176→   176→        let idx = i + 1
+   177→   177→        if (takenIdx.has(idx)) idx = ++appendCounter
+   178→   178→        takenIdx.add(idx)
+   179→   179→        stmt.run(uuid(), novel.id, idx, c.title, c.url)
+   180→   180→        addedChapters++
+   181→   181→      }
+   182→   182→      novel = getNovel(novel.id)!
+   183→   183→      if (addedChapters > 0) logInfo(`Đã thêm ${addedChapters} chương mới cho «${meta.title}»`)
+   184→   184→    }
+   185→   185→
+   186→   186→    // ---- select tasks for this job ----
+   187→   187→    const from = body?.chapterFrom != null ? Math.max(1, parseInt(String(body.chapterFrom), 10) || 1) : null
+   188→   188→    const to = body?.chapterTo != null ? parseInt(String(body.chapterTo), 10) || null : null
+   189→   189→    let rows = all<ChapterRow>('SELECT * FROM chapters WHERE novel_id = ? ORDER BY idx ASC', novel.id)
+   190→   190→    if (from != null || to != null) {
+   191→   191→      rows = rows.filter((r) => (!from || r.idx >= from) && (!to || r.idx <= to))
+   192→   192→    }
+   193→   193→    const taskRows = rows.filter((r) => r.content === null || r.status === 'pending' || r.status === 'error')
+   194→   194→
+   195→   195→    const jobId = uuid()
+   196→   196→    const params = {
+   197→   197→      url: bookUrl,
+   198→   198→      autoTranslate: body?.autoTranslate === true,
+   199→   199→      chapterFrom: from,
+   200→   200→      chapterTo: to,
+   201→   201→    }
+   202→   202→    run(
+   203→   203→      `INSERT INTO jobs (id, type, status, novel_id, params, progress, total, created_at, updated_at)
+   204→   204→       VALUES (?,?, 'queued', ?, ?, 0, ?, ?, ?)`,
+   205→   205→      jobId,
+   206→   206→      'scrape',
+   207→   207→      novel.id,
+   208→   208→      JSON.stringify(params),
+   209→   209→      taskRows.length,
+   210→   210→      ts,
+   211→   211→      ts
+   212→   212→    )
+   213→   213→    logInfo(
+   214→   214→      `Đã tạo job cào «${novel.title}»: ${taskRows.length}/${rows.length} chương cần cào${addedChapters ? ` (trong đó ${addedChapters} chương mới)` : ''}`
+   215→   215→    )
+   216→   216→    emitJob(jobId)
+   217→   217→    emitNovel(novelRowToSummary(novel))
+   218→   218→    this.enqueueScrapeTasks(jobId, novel.id, taskRows)
+   219→   219→    if (taskRows.length === 0) this.maybeFinishJob(jobId)
+   220→   220→    return { jobId, novelId: novel.id, totalChapters: rows.length, tasks: taskRows.length }
+   221→   221→  }
+   222→   222→
+   223→   223→  /** POST /jobs/translate */
+   224→   224→  startTranslateJob(body: Record<string, unknown>): { jobId: string; novelId: string; note?: string } {
+   225→   225→    const novelId = String(body?.novelId ?? '').trim()
+   226→   226→    if (!novelId) throw new Error('Thiếu tham số novelId')
+   227→   227→    const novel = getNovel(novelId)
+   228→   228→    if (!novel) throw new Error('Không tìm thấy truyện')
+   229→   229→    const force = body?.force === true
+   230→   230→    const s = this.getSettings()
+   231→   231→    const ts = now()
+   232→   232→
+   233→   233→    const jobId = uuid()
+   234→   234→    const params = { novelId, force }
+   235→   235→
+   236→   236→    if (!hasActiveGeminiKeys()) {
+   237→   237→      run(
+   238→   238→        `INSERT INTO jobs (id, type, status, novel_id, params, progress, total, error, created_at, updated_at, finished_at)
+   239→   239→         VALUES (?,?, 'error', ?, ?, 0, 0, ?, ?, ?, ?)`,
+   240→   240→        jobId,
+   241→   241→        'translate',
+   242→   242→        novelId,
+   243→   243→        JSON.stringify(params),
+   244→   244→        'Chưa có Gemini API key hoạt động — thêm key trong Cài đặt',
+   245→   245→        ts,
+   246→   246→        ts,
+   247→   247→        ts
+   248→   248→      )
+   249→   249→      logWarn('Không thể tạo job dịch: chưa có Gemini API key hoạt động')
+   250→   250→      emitJob(jobId)
+   251→   251→      return { jobId, novelId, note: 'Chưa có Gemini API key hoạt động — thêm key trong Cài đặt' }
+   252→   252→    }
+   253→   253→
+   254→   254→    const srcLang = s.sourceLang === 'auto' ? novel.lang : s.sourceLang
+   255→   255→    if (srcLang === s.targetLang) {
+   256→   256→      run(
+   257→   257→        `INSERT INTO jobs (id, type, status, novel_id, params, progress, total, created_at, updated_at, finished_at)
+   258→   258→         VALUES (?,?, 'done', ?, ?, 0, 0, ?, ?, ?, ?)`,
+   259→   259→        jobId,
+   260→   260→        'translate',
+   261→   261→        novelId,
+   262→   262→        JSON.stringify(params),
+   263→   263→        ts,
+   264→   264→        ts,
+   265→   265→        ts
+   266→   266→      )
+   267→   267→      logInfo(`Bỏ qua dịch «${novel.title}»: ngôn ngữ nguồn (${srcLang}) đã là ngôn ngữ đích (${s.targetLang})`)
+   268→   268→      emitJob(jobId)
+   269→   269→      return { jobId, novelId, note: `Bỏ qua dịch: nguồn đã là ${srcLang}` }
+   270→   270→    }
+   271→   271→
+   272→   272→    const rows = all<ChapterRow>(
+   273→   273→      `SELECT * FROM chapters WHERE novel_id = ? AND content IS NOT NULL ${force ? '' : 'AND translated IS NULL'} ORDER BY idx ASC`,
+   274→   274→      novelId
+   275→   275→    )
+   276→   276→    run(
+   277→   277→      `INSERT INTO jobs (id, type, status, novel_id, params, progress, total, created_at, updated_at)
+   278→   278→       VALUES (?,?, 'queued', ?, ?, 0, ?, ?, ?)`,
+   279→   279→      jobId,
+   280→   280→      'translate',
+   281→   281→      novelId,
+   282→   282→      JSON.stringify(params),
+   283→   283→      rows.length,
+   284→   284→      ts,
+   285→   285→      ts
+   286→   286→    )
+   287→   287→    logInfo(`Đã tạo job dịch «${novel.title}»: ${rows.length} chương${force ? ' (dịch lại tất cả)' : ''}`)
+   288→   288→    emitJob(jobId)
+   289→   289→    this.enqueueTranslateTasks(jobId, novelId, rows)
+   290→   290→    if (rows.length === 0) this.maybeFinishJob(jobId)
+   291→   291→    return { jobId, novelId }
+   292→   292→  }
+   293→   293→
+   294→   294→  /** POST /jobs/retry — re-scrape chapters with status error/pending. */
+   295→   295→  startRetryJob(body: Record<string, unknown>): { jobId: string; novelId: string; tasks: number } {
+   296→   296→    const novelId = String(body?.novelId ?? '').trim()
+   297→   297→    if (!novelId) throw new Error('Thiếu tham số novelId')
+   298→   298→    const novel = getNovel(novelId)
+   299→   299→    if (!novel) throw new Error('Không tìm thấy truyện')
+   300→   300→    const rows = all<ChapterRow>(
+   301→   301→      "SELECT * FROM chapters WHERE novel_id = ? AND status IN ('error','pending') ORDER BY idx ASC",
+   302→   302→      novelId
+   303→   303→    )
+   304→   304→    const ts = now()
+   305→   305→    const jobId = uuid()
+   306→   306→    run(
+   307→   307→      `INSERT INTO jobs (id, type, status, novel_id, params, progress, total, created_at, updated_at)
+   308→   308→       VALUES (?,?, 'queued', ?, ?, 0, ?, ?, ?)`,
+   309→   309→      jobId,
+   310→   310→      'retry',
+   311→   311→      novelId,
+   312→   312→      JSON.stringify({ novelId }),
+   313→   313→      rows.length,
+   314→   314→      ts,
+   315→   315→      ts
+   316→   316→    )
+   317→   317→    logInfo(`Đã tạo job cào lại «${novel.title}»: ${rows.length} chương lỗi/chưa cào`)
+   318→   318→    emitJob(jobId)
+   319→   319→    this.enqueueScrapeTasks(jobId, novelId, rows)
+   320→   320→    if (rows.length === 0) this.maybeFinishJob(jobId)
+   321→   321→    return { jobId, novelId, tasks: rows.length }
+   322→   322→  }
+   323→   323→
+   324→   324→  // ============================================================
+   325→   325→  // Job control
+   326→   326→  // ============================================================
+   327→   327→
+   328→   328→  pause(jobId: string, reason?: string): void {
+   329→   329→    const job = getJob(jobId)
+   330→   330→    if (!job) throw new Error('Không tìm thấy job')
+   331→   331→    if (job.status !== 'running' && job.status !== 'queued') {
+   332→   332→      throw new Error(`Không thể tạm dừng job đang ${job.status}`)
+   333→   333→    }
+   334→   334→    run('UPDATE jobs SET status = ?, error = COALESCE(?, error), updated_at = ? WHERE id = ?', 'paused', reason ?? null, now(), jobId)
+   335→   335→    this.dropQueuedTasks(jobId)
+   336→   336→    this.consecutiveErrors.delete(jobId)
+   337→   337→    logInfo(`Đã tạm dừng job ${jobId.slice(0, 8)} (${job.type})${reason ? ` — ${reason}` : ''}`)
+   338→   338→    emitJob(jobId)
+   339→   339→  }
+   340→   340→
+   341→   341→  resume(jobId: string): void {
+   342→   342→    const job = getJob(jobId)
+   343→   343→    if (!job) throw new Error('Không tìm thấy job')
+   344→   344→    if (job.status !== 'paused') throw new Error(`Không thể tiếp tục job đang ${job.status}`)
+   345→   345→    run('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', 'queued', now(), jobId)
+   346→   346→    this.consecutiveErrors.delete(jobId)
+   347→   347→    this.reenqueueJob(job)
+   348→   348→    logInfo(`Đã tiếp tục job ${jobId.slice(0, 8)} (${job.type})`)
+   349→   349→    emitJob(jobId)
+   350→   350→  }
+   351→   351→
+   352→   352→  cancel(jobId: string): void {
+   353→   353→    const job = getJob(jobId)
+   354→   354→    if (!job) throw new Error('Không tìm thấy job')
+   355→   355→    if (job.status === 'done' || job.status === 'cancelled') {
+   356→   356→      this.dropQueuedTasks(jobId)
+   357→   357→      return
+   358→   358→    }
+   359→   359→    run('UPDATE jobs SET status = ?, finished_at = ?, updated_at = ? WHERE id = ?', 'cancelled', now(), now(), jobId)
+   360→   360→    this.dropQueuedTasks(jobId)
+   361→   361→    this.consecutiveErrors.delete(jobId)
+   362→   362→    logInfo(`Đã huỷ job ${jobId.slice(0, 8)} (${job.type})`)
+   363→   363→    emitJob(jobId)
+   364→   364→  }
+   365→   365→
+   366→   366→  private dropQueuedTasks(jobId: string): void {
+   367→   367→    this.scrapeQueue = this.scrapeQueue.filter((t) => t.jobId !== jobId)
+   368→   368→    this.translateQueue = this.translateQueue.filter((t) => t.jobId !== jobId)
+   369→   369→  }
+   370→   370→
+   371→   371→  /** Recompute remaining tasks of a (paused/queued) job FROM the DB. */
+   372→   372→  private reenqueueJob(job: JobRowDb): void {
+   373→   373→    let params: Record<string, unknown> = {}
+   374→   374→    try {
+   375→   375→      params = JSON.parse(job.params || '{}')
+   376→   376→    } catch {
+   377→   377→      params = {}
+   378→   378→    }
+   379→   379→    const novelId = job.novel_id
+   380→   380→    if (!novelId) return
+   381→   381→
+   382→   382→    let taskRows: ChapterRow[] = []
+   383→   383→    if (job.type === 'translate') {
+   384→   384→      const force = params.force === true
+   385→   385→      taskRows = all<ChapterRow>(
+   386→   386→        `SELECT * FROM chapters WHERE novel_id = ? AND content IS NOT NULL ${force ? "AND status != 'translated'" : 'AND translated IS NULL'} ORDER BY idx ASC`,
+   387→   387→        novelId
+   388→   388→      )
+   389→   389→      this.enqueueTranslateTasks(job.id, novelId, taskRows)
+   390→   390→    } else {
+   391→   391→      const from = params.chapterFrom != null ? Number(params.chapterFrom) : null
+   392→   392→      const to = params.chapterTo != null ? Number(params.chapterTo) : null
+   393→   393→      let sql = "SELECT * FROM chapters WHERE novel_id = ? AND (content IS NULL OR status IN ('pending','error'))"
+   394→   394→      const args: unknown[] = [novelId]
+   395→   395→      if (from != null && to != null) {
+   396→   396→        sql += ' AND idx BETWEEN ? AND ?'
+   397→   397→        args.push(from, to)
+   398→   398→      } else if (from != null) {
+   399→   399→        sql += ' AND idx >= ?'
+   400→   400→        args.push(from)
+   401→   401→      } else if (to != null) {
+   402→   402→        sql += ' AND idx <= ?'
+   403→   403→        args.push(to)
+   404→   404→      }
+   405→   405→      sql += ' ORDER BY idx ASC'
+   406→   406→      taskRows = all<ChapterRow>(sql, ...args)
+   407→   407→      this.enqueueScrapeTasks(job.id, novelId, taskRows)
+   408→   408→    }
+   409→   409→    // keep totals consistent: progress + remaining
+   410→   410→    run('UPDATE jobs SET total = ?, updated_at = ? WHERE id = ?', job.progress + taskRows.length, now(), job.id)
+   411→   411→    if (taskRows.length === 0) this.maybeFinishJob(job.id)
+   412→   412→  }
+   413→   413→
+   414→   414→  private enqueueScrapeTasks(jobId: string, novelId: string, rows: ChapterRow[]): void {
+   415→   415→    for (const r of rows) {
+   416→   416→      this.scrapeQueue.push({ jobId, novelId, chapterId: r.id })
+   417→   417→    }
+   418→   418→  }
+   419→   419→
+   420→   420→  private enqueueTranslateTasks(jobId: string, novelId: string, rows: ChapterRow[]): void {
+   421→   421→    for (const r of rows) {
+   422→   422→      this.translateQueue.push({ jobId, novelId, chapterId: r.id })
+   423→   423→    }
+   424→   424→  }
+   425→   425→
+   426→   426→  // ============================================================
+   427→   427→  // Workers
+   428→   428→  // ============================================================
+   429→   429→
+   430→   430→  private async scrapeWorkerLoop(_workerId: number): Promise<void> {
+   431→   431→    while (this.running) {
+   432→   432→      const s = this.getSettings()
+   433→   433→      const concurrency = Math.max(1, Math.min(s.scrapeConcurrency || 3, MAX_WORKERS))
+   434→   434→      if (this.scrapeActive >= concurrency) {
+   435→   435→        await sleep(250)
+   436→   436→        continue
+   437→   437→      }
+   438→   438→      const task = this.scrapeQueue.shift()
+   439→   439→      if (!task) {
+   440→   440→        await sleep(300)
+   441→   441→        continue
+   442→   442→      }
+   443→   443→      this.scrapeActive++
+   444→   444→      this.inFlight.set(task.jobId, (this.inFlight.get(task.jobId) ?? 0) + 1)
+   445→   445→      try {
+   446→   446→        await this.processScrapeTask(task)
+   447→   447→      } catch (e) {
+   448→   448→        logError(`Lỗi worker cào (job ${task.jobId.slice(0, 8)}): ${(e as Error).message}`)
+   449→   449→      } finally {
+   450→   450→        this.scrapeActive--
+   451→   451→        const v = (this.inFlight.get(task.jobId) ?? 1) - 1
+   452→   452→        if (v <= 0) this.inFlight.delete(task.jobId)
+   453→   453→        else this.inFlight.set(task.jobId, v)
+   454→   454→        try {
+   455→   455→          this.maybeFinishJob(task.jobId)
+   456→   456→        } catch {
+   457→   457→          /* ignore */
+   458→   458→        }
+   459→   459→      }
+   460→   460→    }
+   461→   461→  }
+   462→   462→
+   463→   463→  private async translateWorkerLoop(_workerId: number): Promise<void> {
+   464→   464→    while (this.running) {
+   465→   465→      const s = this.getSettings()
+   466→   466→      const concurrency = Math.max(1, Math.min(s.translateConcurrency || 2, MAX_WORKERS))
+   467→   467→      if (this.translateActive >= concurrency) {
+   468→   468→        await sleep(250)
+   469→   469→        continue
+   470→   470→      }
+   471→   471→      const task = this.translateQueue.shift()
+   472→   472→      if (!task) {
+   473→   473→        await sleep(300)
+   474→   474→        continue
+   475→   475→      }
+   476→   476→      this.translateActive++
+   477→   477→      this.inFlight.set(task.jobId, (this.inFlight.get(task.jobId) ?? 0) + 1)
+   478→   478→      try {
+   479→   479→        await this.processTranslateTask(task)
+   480→   480→      } catch (e) {
+   481→   481→        logError(`Lỗi worker dịch (job ${task.jobId.slice(0, 8)}): ${(e as Error).message}`)
+   482→   482→      } finally {
+   483→   483→        this.translateActive--
+   484→   484→        const v = (this.inFlight.get(task.jobId) ?? 1) - 1
+   485→   485→        if (v <= 0) this.inFlight.delete(task.jobId)
+   486→   486→        else this.inFlight.set(task.jobId, v)
+   487→   487→        try {
+   488→   488→          this.maybeFinishJob(task.jobId)
+   489→   489→        } catch {
+   490→   490→          /* ignore */
+   491→   491→        }
+   492→   492→      }
+   493→   493→    }
+   494→   494→  }
+   495→   495→
+   496→   496→  private ensureJobRunning(jobId: string): boolean {
+   497→   497→    const job = getJob(jobId)
+   498→   498→    if (!job) return false
+   499→   499→    if (job.status === 'paused' || job.status === 'cancelled' || job.status === 'done' || job.status === 'error') {
+   500→   500→      return false
+   501→   501→    }
+   502→   502→    if (job.status === 'queued') {
+   503→   503→      run('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?', 'running', now(), jobId)
+   504→   504→      emitJob(jobId)
+   505→   505→    }
+   506→   506→    return true
+   507→   507→  }
+   508→   508→
+   509→   509→  private async processScrapeTask(task: ScrapeTask): Promise<void> {
+   510→   510→    if (!this.ensureJobRunning(task.jobId)) return
+   511→   511→    const s = this.getSettings()
+   512→   512→
+   513→   513→    const ch = get<ChapterRow>('SELECT * FROM chapters WHERE id = ?', task.chapterId)
+   514→   514→    if (!ch) {
+   515→   515→      this.bumpProgress(task.jobId)
+   516→   516→      return
+   517→   517→    }
+   518→   518→    // skip if already scraped by someone else
+   519→   519→    if (ch.content && ch.status !== 'error' && ch.status !== 'pending') {
+   520→   520→      this.bumpProgress(task.jobId)
+   521→   521→      return
+   522→   522→    }
+   523→   523→    const novel = getNovel(task.novelId)
+   524→   524→    const adapter: SiteAdapter | null = adapterById(novel?.source_site ?? '') ?? detectAdapter(ch.source_url)
+   525→   525→    if (!adapter) {
+   526→   526→      run('UPDATE chapters SET status = ?, error = ? WHERE id = ?', 'error', 'Không nhận diện được site', ch.id)
+   527→   527→      this.bumpProgress(task.jobId)
+   528→   528→      return
+   529→   529→    }
+   530→   530→
+   531→   531→    try {
+   532→   532→      const { title, content } = await adapter.fetchChapter(ch.source_url, { bookUrl: novel?.source_url })
+   533→   533→      let text = cleanNovelText(content, adapter.id)
+   534→   534→      // drop a leading line that duplicates the chapter title
+   535→   535→      const paras = text.split('\n\n')
+   536→   536→      if (paras.length > 1) {
+   537→   537→        const first = normCompare(paras[0])
+   538→   538→        const t = normCompare(title)
+   539→   539→        if (t && (first === t || (t.length >= 6 && first.startsWith(t)))) {
+   540→   540→          text = paras.slice(1).join('\n\n')
+   541→   541→        }
+   542→   542→      }
+   543→   543→      if (text.replace(/\s/g, '').length < 20) throw new Error('Nội dung chương trống sau khi làm sạch')
+   544→   544→      run(
+   545→   545→        `UPDATE chapters SET title = ?, content = ?, status = 'scraped', error = NULL, scraped_at = ? WHERE id = ?`,
+   546→   546→        ch.title || title || `Chương ${ch.idx}`,
+   547→   547→        text,
+   548→   548→        now(),
+   549→   549→        ch.id
+   550→   550→      )
+   551→   551→      this.consecutiveErrors.delete(task.jobId)
+   552→   552→      const job = getJob(task.jobId)
+   553→   553→      if (ch.idx % 10 === 0 && job) {
+   554→   554→        logInfo(`Đã cào ${job.progress + 1}/${job.total} chương «${novel?.title ?? ''}» (chương ${ch.idx})`)
+   555→   555→      }
+   556→   556→      this.emitChapterRow(ch.id)
+   557→   557→    } catch (e) {
+   558→   558→      const msg = (e as Error).message ?? String(e)
+   559→   559→      run('UPDATE chapters SET status = ?, error = ? WHERE id = ?', 'error', msg, ch.id)
+   560→   560→      const cnt = (this.consecutiveErrors.get(task.jobId) ?? 0) + 1
+   561→   561→      this.consecutiveErrors.set(task.jobId, cnt)
+   562→   562→      logWarn(`Lỗi cào chương ${ch.idx} «${ch.title}»: ${msg}`)
+   563→   563→      this.emitChapterRow(ch.id)
+   564→   564→      if (cnt > CONSECUTIVE_ERROR_LIMIT) {
+   565→   565→        logError(`Quá ${CONSECUTIVE_ERROR_LIMIT} lỗi liên tiếp — tạm dừng job (site có thể đang chặn)`)
+   566→   566→        try {
+   567→   567→          this.pause(task.jobId, `Tạm dừng tự động: hơn ${CONSECUTIVE_ERROR_LIMIT} lỗi liên tiếp (site có thể đang chặn)`)
+   568→   568→        } catch {
+   569→   569→          /* ignore */
+   570→   570→        }
+   571→   571→        return
+   572→   572→      }
+   573→   573→    }
+   574→   574→
+   575→   575→    this.recomputeNovelCounts(task.novelId)
+   576→   576→    this.bumpProgress(task.jobId)
+   577→   577→
+   578→   578→    const delay = Math.max(0, s.scrapeDelayMs || 0)
+   579→   579→    if (delay) await sleep(delay)
+   580→   580→  }
+   581→   581→
+   582→   582→  private async processTranslateTask(task: TranslateTask): Promise<void> {
+   583→   583→    if (!this.ensureJobRunning(task.jobId)) return
+   584→   584→    const s = this.getSettings()
+   585→   585→
+   586→   586→    const ch = get<ChapterRow>('SELECT * FROM chapters WHERE id = ?', task.chapterId)
+   587→   587→    if (!ch || ch.content === null) {
+   588→   588→      this.bumpProgress(task.jobId)
+   589→   589→      return
+   590→   590→    }
+   591→   591→    const novel = getNovel(task.novelId)
+   592→   592→    if (!novel) {
+   593→   593→      this.bumpProgress(task.jobId)
+   594→   594→      return
+   595→   595→    }
+   596→   596→
+   597→   597→    run("UPDATE chapters SET status = 'translating' WHERE id = ?", ch.id)
+   598→   598→    this.emitChapterRow(ch.id)
+   599→   599→
+   600→   600→    const srcLang = s.sourceLang === 'auto' ? novel.lang : s.sourceLang
+   601→   601→    try {
+   602→   602→      const translated = await translateText(ch.content, {
+   603→   603→        novelTitle: novel.title,
+   604→   604→        novelAuthor: novel.author,
+   605→   605→        sourceLang: srcLang,
+   606→   606→        targetLang: s.targetLang,
+   607→   607→        model: s.geminiModel,
+   608→   608→        chunkSize: s.chunkSize,
+   609→   609→      })
+   610→   610→      if (!translated.trim()) throw new Error('Bản dịch rỗng')
+   611→   611→      run(
+   612→   612→        `UPDATE chapters SET translated = ?, status = 'translated', translated_at = ? WHERE id = ?`,
+   613→   613→        translated,
+   614→   614→        now(),
+   615→   615→        ch.id
+   616→   616→      )
+   617→   617→      this.consecutiveErrors.delete(task.jobId)
+   618→   618→      const job = getJob(task.jobId)
+   619→   619→      if (ch.idx % 10 === 0 && job) {
+   620→   620→        logInfo(`Đã dịch ${job.progress + 1}/${job.total} chương «${novel.title}» (chương ${ch.idx})`)
+   621→   621→      }
+   622→   622→    } catch (e) {
+   623→   623→      const err = e as Error
+   624→   624→      if (e instanceof GeminiNoKeysError) {
+   625→   625→        // no usable keys — abort the whole job, revert chapter
+   626→   626→        run("UPDATE chapters SET status = 'scraped' WHERE id = ?", ch.id)
+   627→   627→        run(
+   628→   628→          'UPDATE jobs SET status = ?, error = ?, finished_at = ?, updated_at = ? WHERE id = ?',
+   629→   629→          'error',
+   630→   630→          err.message,
+   631→   631→          now(),
+   632→   632→          now(),
+   633→   633→          task.jobId
+   634→   634→        )
+   635→   635→        this.dropQueuedTasks(task.jobId)
+   636→   636→        logError(`Job dịch dừng: ${err.message}`)
+   637→   637→        emitChapterRow(ch.id)
+   638→   638→        emitJob(task.jobId)
+   639→   639→        return
+   640→   640→      }
+   641→   641→      run('UPDATE chapters SET status = ?, error = ? WHERE id = ?', 'error', err.message ?? String(err), ch.id)
+   642→   642→      const cnt = (this.consecutiveErrors.get(task.jobId) ?? 0) + 1
+   643→   643→      this.consecutiveErrors.set(task.jobId, cnt)
+   644→   644→      logWarn(`Lỗi dịch chương ${ch.idx} «${ch.title}»: ${err.message}`)
+   645→   645→      if (cnt > CONSECUTIVE_ERROR_LIMIT) {
+   646→   646→        logError(`Quá ${CONSECUTIVE_ERROR_LIMIT} lỗi dịch liên tiếp — tạm dừng job`)
+   647→   647→        try {
+   648→   648→          this.pause(task.jobId, `Tạm dừng tự động: hơn ${CONSECUTIVE_ERROR_LIMIT} lỗi dịch liên tiếp`)
+   649→   649→        } catch {
+   650→   650→          /* ignore */
+   651→   651→        }
+   652→   652→        return
+   653→   653→      }
+   654→   654→    }
+   655→   655→
+   656→   656→    this.recomputeNovelCounts(task.novelId)
+   657→   657→    this.emitChapterRow(ch.id)
+   658→   658→    this.bumpProgress(task.jobId)
+   659→   659→
+   660→   660→    const delay = Math.max(0, s.translateDelayMs || 0)
+   661→   661→    if (delay) await sleep(delay)
+   662→   662→  }
+   663→   663→
+   664→   664→  // ============================================================
+   665→   665→  // Shared helpers
+   666→   666→  // ============================================================
+   667→   667→
+   668→   668→  private bumpProgress(jobId: string): void {
+   669→   669→    run(
+   670→   670→      "UPDATE jobs SET progress = MIN(progress + 1, total), updated_at = ? WHERE id = ? AND status IN ('running','queued')",
+   671→   671→      now(),
+   672→   672→      jobId
+   673→   673→    )
+   674→   674→    emitJob(jobId)
+   675→   675→  }
+   676→   676→
+   677→   677→  private maybeFinishJob(jobId: string): void {
+   678→   678→    if ((this.inFlight.get(jobId) ?? 0) > 0) return
+   679→   679→    if (this.scrapeQueue.some((t) => t.jobId === jobId)) return
+   680→   680→    if (this.translateQueue.some((t) => t.jobId === jobId)) return
+   681→   681→    const job = getJob(jobId)
+   682→   682→    if (!job || (job.status !== 'running' && job.status !== 'queued')) return
+   683→   683→
+   684→   684→    run('UPDATE jobs SET status = ?, error = NULL, finished_at = ?, updated_at = ? WHERE id = ?', 'done', now(), now(), jobId)
+   685→   685→    const novel = job.novel_id ? getNovel(job.novel_id) : null
+   686→   686→    logSuccess(
+   687→   687→      `Hoàn thành job ${job.type} «${novel?.title ?? '—'}»: ${job.progress}/${job.total} chương`
+   688→   688→    )
+   689→   689→    emitJob(jobId)
+   690→   690→
+   691→   691→    // post-actions for scrape/retry jobs
+   692→   692→    if ((job.type === 'scrape' || job.type === 'retry') && job.novel_id) {
+   693→   693→      let params: Record<string, unknown> = {}
+   694→   694→      try {
+   695→   695→        params = JSON.parse(job.params || '{}')
+   696→   696→      } catch {
+   697→   697→        params = {}
+   698→   698→      }
+   699→   699→      const s = this.getSettings()
+   700→   700→      if (params.autoTranslate === true) {
+   701→   701→        const n = getNovel(job.novel_id)
+   702→   702→        const srcLang = n ? (s.sourceLang === 'auto' ? n.lang : s.sourceLang) : 'zh'
+   703→   703→        if (srcLang === s.targetLang) {
+   704→   704→          logInfo('Bỏ qua tự động dịch: ngôn ngữ nguồn trùng ngôn ngữ đích')
+   705→   705→        } else if (!hasActiveGeminiKeys()) {
+   706→   706→          logWarn('Bỏ qua tự động dịch: chưa có Gemini API key hoạt động')
+   707→   707→        } else {
+   708→   708→          void this.startTranslateJob({ novelId: job.novel_id }).catch((e) =>
+   709→   709→            logError(`Không tạo được job dịch tự động: ${(e as Error).message}`)
+   710→   710→          )
+   711→   711→        }
+   712→   712→      }
+   713→   713→      if (s.autoSyncSupabase && s.supabaseEnabled && s.supabaseUrl && s.supabaseKey) {
+   714→   714→        void supabasePush(job.novel_id)
+   715→   715→          .then((r) => logSuccess(`Tự động sync Supabase xong: ${r.novels} truyện / ${r.chapters} chương`))
+   716→   716→          .catch((e) => logWarn(`Tự động sync Supabase lỗi (không ảnh hưởng job): ${(e as Error).message}`))
+   717→   717→      }
+   718→   718→    }
+   719→   719→  }
+   720→   720→
+   721→   721→  private recomputeNovelCounts(novelId: string): void {
+   722→   722→    run(
+   723→   723→      `UPDATE novels SET
+   724→   724→         scraped_count = (SELECT COUNT(*) FROM chapters WHERE novel_id = ? AND status IN ('scraped','translating','translated')),
+   725→   725→         translated_count = (SELECT COUNT(*) FROM chapters WHERE novel_id = ? AND status = 'translated'),
+   726→   726→         updated_at = ?
+   727→   727→       WHERE id = ?`,
+   728→   728→      novelId,
+   729→   729→      novelId,
+   730→   730→      now(),
+   731→   731→      novelId
+   732→   732→    )
+   733→   733→    const n = getNovel(novelId)
+   734→   734→    if (n) emitNovel(novelRowToSummary(n))
+   735→   735→  }
+   736→   736→
+   737→   737→  private emitChapterRow(chapterId: string): void {
+   738→   738→    const ch = get<ChapterRow>('SELECT * FROM chapters WHERE id = ?', chapterId)
+   739→   739→    if (!ch) return
+   740→   740→    emitChapter({
+   741→   741→      novelId: ch.novel_id,
+   742→   742→      idx: ch.idx,
+   743→   743→      status: ch.status,
+   744→   744→      hasContent: ch.content !== null && ch.content.length > 0,
+   745→   745→      hasTranslated: ch.translated !== null && ch.translated.length > 0,
+   746→   746→    })
+   747→   747→  }
+   748→   748→
+   749→   749→  buildStats(): EngineStats {
+   750→   750→    const row = get<Record<string, number>>(
+   751→   751→      `SELECT
+   752→   752→        (SELECT COUNT(*) FROM novels) AS novels,
+   753→   753→        (SELECT COUNT(*) FROM chapters) AS chapters,
+   754→   754→        (SELECT COUNT(*) FROM chapters WHERE status IN ('scraped','translating','translated')) AS scraped,
+   755→   755→        (SELECT COUNT(*) FROM chapters WHERE status = 'translated') AS translated,
+   756→   756→        (SELECT COUNT(*) FROM jobs WHERE status = 'running') AS runningJobs,
+   757→   757→        (SELECT COUNT(*) FROM jobs WHERE status = 'queued') AS queuedJobs,
+   758→   758→        (SELECT COUNT(*) FROM api_keys) AS keysTotal,
+   759→   759→        (SELECT COUNT(*) FROM api_keys WHERE active = 1 AND status != 'error') AS keysActive,
+   760→   760→        (SELECT COUNT(*) FROM api_keys WHERE status = 'rate_limited') AS keysRateLimited,
+   761→   761→        (SELECT COUNT(*) FROM api_keys WHERE status = 'error') AS keysError`
+   762→   762→    )
+   763→   763→    return {
+   764→   764→      novels: row?.novels ?? 0,
+   765→   765→      chapters: row?.chapters ?? 0,
+   766→   766→      scraped: row?.scraped ?? 0,
+   767→   767→      translated: row?.translated ?? 0,
+   768→   768→      runningJobs: row?.runningJobs ?? 0,
+   769→   769→      queuedJobs: row?.queuedJobs ?? 0,
+   770→   770→      keysTotal: row?.keysTotal ?? 0,
+   771→   771→      keysActive: row?.keysActive ?? 0,
+   772→   772→      keysRateLimited: row?.keysRateLimited ?? 0,
+   773→   773→      keysError: row?.keysError ?? 0,
+   774→   774→    }
+   775→   775→  }
+   776→   776→
+   777→   777→  queueLengths(): { scrape: number; translate: number } {
+   778→   778→    return { scrape: this.scrapeQueue.length, translate: this.translateQueue.length }
+   779→   779→  }
+   780→   780→}
+   781→   781→
