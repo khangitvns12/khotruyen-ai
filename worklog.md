@@ -120,3 +120,23 @@ Work Log:
 
 Stage Summary:
 - Repo is GitHub/Vercel-ready: env-driven deployment (ENGINE_URL, NEXT_PUBLIC_ENGINE_URL, ENGINE_READS, PORT, ENGINE_DB), engine Dockerfile for Railway/Render/Fly/VPS, postinstall prisma generate for Vercel builds, README.md contains the complete Vietnamese deployment guide matching the final chat answer.
+
+---
+Task ID: 5
+Agent: main (Z.ai Code)
+Task: Fix lỗi 404 khi kiểm tra kết nối Supabase (user report: "lỗi 404 mặc dù tham số đúng")
+
+Work Log:
+- Chẩn đoán: POST /api/supabase/test → Next.js 404. Nguyên nhân: file src/app/api/supabase/test/route.ts KHÔNG tồn tại — nó bị .gitignore pattern `test` trần (match mọi thư mục tên test ở mọi cấp) loại khỏi git ngay từ đầu, nên không có trong commit nào; sandbox reset ngày 21/10 02:26 (khôi phục workspace về git HEAD + dựng lại DB trống) đã xoá file này → UI gọi route không tồn tại → 404 bất kể tham số.
+- Phát hiện sandbox reset: db/custom.db được dựng lại trống (schema-only, mtime 02:26), process engine PID 929 khởi động lại 02:26, dữ liệu test ngày 20/10 (1 truyện 一世獨尊 2407 chương + key "Test") bị mất — không phải bug của app.
+- Fix 1: tạo src/app/api/supabase/test/route.ts (engineProxy → engine POST /supabase/test, giống pattern sync/pull).
+- Fix 2: .gitignore — neo `test`→`/test`, `prompt`→`/prompt` (chỉ áp dụng thư mục gốc) để route không bị ignore nữa; xác nhận không còn file nguồn nào bị ignore oan (git status --ignored).
+- Fix 3 (củng cố engine supabase.ts): normalizeSupabaseUrl (bỏ đuôi /rest/v1 thừa → tránh /rest/v1/rest/v1/ = 404 thật, bỏ slash cuối, đổi link dashboard supabase.com/dashboard/project/<ref> → https://<ref>.supabase.co), normalizeSupabaseKey (xoá whitespace/xuống dòng), thông báo lỗi tiếng Việt rõ nghĩa cho 401/403, 404 (hướng dẫn dùng Project URL), timeout 15s, 540 (project pause); supabaseConfig áp dụng cùng chuẩn hoá cho push/pull.
+- Kiểm chứng bằng mock Supabase PostgREST (:3010, bun serve): 7/7 case pass qua engine + route Next — URL sạch / URL kèm /rest/v1 (404 cũ, giờ OK) / slash cuối + key có xuống dòng / key sai → lỗi 401 VN / path lạ → lỗi 404 VN có hướng dẫn / POST qua route Next mới ×2. Mock log xác nhận path chuẩn hoá + headers apikey/Bearer đầy đủ.
+- Browser E2E (gateway :81): Cài đặt → Supabase → điền URL "http://localhost:3010/rest/v1" (cố tình sai) + key → toast "Kết nối Supabase thành công"; key sai → toast lỗi 401 tiếng Việt.
+- Sync trả 0/0/0: KHÔNG phải bug — DB trống sau reset (đã đối chiếu engine /stats, đọc trực tiếp file DB, /logs ring buffer). PUT xoá settings hoạt động đúng (đã dọn settings test).
+- engine.log biến mất: logger chỉ ghi console + ring buffer (không ghi file) — file cũ là redirect của lần launch thủ công, không phải bug.
+- bun run lint sạch; dev.log sạch; commit cc2a3e0.
+
+Stage Summary:
+- Lỗi 404 đã sửa gốc rễ (route + .gitignore) và củng cố nhập liệu URL/key; toàn bộ luồng test/sync Supabase được kiểm chứng end-to-end với mock. Lưu ý quan trọng cho user: sandbox reset đã xoá dữ liệu test + key cũ — cần thêm lại Gemini key; dữ liệu bền vững chỉ khi deploy engine lên Railway (volume).
