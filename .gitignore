@@ -45,8 +45,8 @@ next-env.d.ts
 local-*
 .claude
 .z-ai-config
-prompt
-test
+/prompt
+/test
 
 # sandbox / hạ tầng phát triển nội bộ (không dùng khi deploy)
 /skills/

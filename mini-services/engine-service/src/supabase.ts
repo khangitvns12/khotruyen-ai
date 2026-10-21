@@ -7,9 +7,31 @@ import type { NovelRow, ChapterRow, ApiKeyRow } from './types'
 // Supabase sync via PostgREST (contract §8)
 // ============================================================
 
+/**
+ * Chuẩn hoá URL Supabase người dùng dán vào:
+ *  - "https://xxx.supabase.co/"           → "https://xxx.supabase.co"
+ *  - "https://xxx.supabase.co/rest/v1"    → "https://xxx.supabase.co"  (tránh /rest/v1/rest/v1/ → 404)
+ *  - "https://supabase.com/dashboard/project/<ref>" → "https://<ref>.supabase.co"
+ *  - khoẳng trắng/xuống dòng dính kèm khi copy → bị xoá
+ */
+export function normalizeSupabaseUrl(raw: string): string {
+  let u = (raw || '').replace(/\s+/g, '').replace(/\/+$/, '')
+  // Link dashboard → dựng lại URL API theo project ref
+  const dash = u.match(/^https?:\/\/[^/]+\/dashboard\/project\/([a-z0-9]{8,})$/i)
+  if (dash) return `https://${dash[1]}.supabase.co`
+  // Người dùng dán sẵn endpoint REST → bỏ phần đuôi /rest/v1
+  u = u.replace(/\/rest\/v1$/i, '')
+  return u
+}
+
+/** Key là JWT — không chứa khoẳng trắng; xoá hết khi dán kèm xuống dòng. */
+function normalizeSupabaseKey(raw: string): string {
+  return (raw || '').replace(/\s+/g, '')
+}
+
 function supabaseConfig(): { url: string; key: string } {
   const s = loadSettings()
-  return { url: (s.supabaseUrl || '').trim().replace(/\/+$/, ''), key: (s.supabaseKey || '').trim() }
+  return { url: normalizeSupabaseUrl(s.supabaseUrl || ''), key: normalizeSupabaseKey(s.supabaseKey || '') }
 }
 
 function headers(key: string, preferUpsert = true): Record<string, string> {
@@ -39,20 +61,31 @@ async function sbFetch(url: string, init: RequestInit & { headers: Record<string
 
 /** GET {url}/rest/v1/ with apikey — returns when connection is valid. */
 export async function testConnection(url: string, key: string): Promise<void> {
-  const base = (url || '').trim().replace(/\/+$/, '')
-  const k = (key || '').trim()
+  const base = normalizeSupabaseUrl(url || '')
+  const k = normalizeSupabaseKey(key || '')
   if (!base || !k) throw new Error('Thiếu url hoặc key Supabase')
   if (!/^https?:\/\//.test(base)) throw new Error('URL Supabase không hợp lệ (cần https://xxx.supabase.co)')
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 15000)
   let res: Response
   try {
-    res = await fetch(`${base}/rest/v1/`, { headers: headers(k, false) , signal: ctrl.signal })
+    res = await fetch(`${base}/rest/v1/`, { headers: headers(k, false), signal: ctrl.signal })
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg.includes('aborted') || (e as Error)?.name === 'AbortError') {
+      throw new Error('Supabase không phản hồi trong 15 giây — kiểm tra lại URL hoặc mạng')
+    }
+    throw new Error(`Không kết nối được tới Supabase (${msg.slice(0, 120)}) — kiểm tra Project URL`) 
   } finally {
     clearTimeout(timer)
   }
-  if (res.status === 401 || res.status === 403) throw new Error('Key Supabase không hợp lệ (401/403)')
-  if (!res.ok) throw new Error(`Supabase trả về HTTP ${res.status}`)
+  if (res.status === 401 || res.status === 403) throw new Error('Key Supabase không hợp lệ (401/403) — dùng anon hoặc service_role key từ Settings → API')
+  if (res.status === 404) {
+    throw new Error(
+      `Supabase trả về 404 — URL chưa đúng. Dùng "Project URL" dạng https://<mã>.supabase.co (KHÔNG kèm /rest/v1, không dùng link dashboard)`,
+    )
+  }
+  if (!res.ok) throw new Error(`Supabase trả về HTTP ${res.status}${res.status === 540 ? ' (project đang bị pause — mở lại trong dashboard Supabase)' : ''}`)
 }
 
 function novelToApiRow(n: NovelRow): Record<string, unknown> {
